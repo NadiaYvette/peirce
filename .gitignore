@@ -1,0 +1,18 @@
+# Model weights (download separately — Qwen2.5-0.5B)
+models/
+
+# Training data cache (regenerate with python/corpus_loader.py)
+data/embeddings_cache/
+
+# Checkpoints (large binary files)
+checkpoints/
+
+# Julia artifacts
+Manifest.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
