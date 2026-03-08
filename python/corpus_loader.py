@@ -42,7 +42,7 @@ CATEGORIES = [
 
 def read_corpus(corpus_dir: Path = CORPUS_DIR) -> list[dict]:
     """
-    Read all .txt files from corpus subdirectories.
+    Read all .txt and .pdf files from corpus subdirectories.
     Returns list of {"text": ..., "category": ..., "source": ...}
     """
     documents = []
@@ -50,9 +50,10 @@ def read_corpus(corpus_dir: Path = CORPUS_DIR) -> list[dict]:
         cat_dir = corpus_dir / category
         if not cat_dir.exists():
             continue
+
+        # Text files
         for txt_file in sorted(cat_dir.glob("*.txt")):
             text = txt_file.read_text(encoding="utf-8", errors="replace")
-            # Skip empty or very short files
             if len(text.strip()) < 50:
                 continue
             documents.append({
@@ -60,6 +61,23 @@ def read_corpus(corpus_dir: Path = CORPUS_DIR) -> list[dict]:
                 "category": category,
                 "source": txt_file.name,
             })
+
+        # PDF files
+        for pdf_file in sorted(cat_dir.glob("*.pdf")):
+            try:
+                from python.pdf_extract import extract_text_from_pdf, clean_extracted_text
+                text = extract_text_from_pdf(pdf_file)
+                text = clean_extracted_text(text)
+                if len(text.strip()) < 50:
+                    continue
+                documents.append({
+                    "text": text.strip(),
+                    "category": category,
+                    "source": pdf_file.name,
+                })
+            except Exception as e:
+                print(f"  Warning: could not extract {pdf_file.name}: {e}")
+
     return documents
 
 
