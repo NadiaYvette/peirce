@@ -58,20 +58,19 @@ function find_latest_checkpoint(tag::String="phase1")
     candidates = filter(f -> startswith(f, "$(tag)_epoch") && endswith(f, ".bson"), readdir(CHECKPOINT_DIR))
     isempty(candidates) && return nothing
 
-    # Extract epoch numbers and find max
-    best_epoch = 0
+    # Use file modification time to find the most recently saved checkpoint
+    # Matches both epoch-end and mid-epoch checkpoints
+    best_mtime = 0.0
     best_file = ""
     for f in candidates
-        m = match(r"epoch(\d+)\.bson$", f)
-        if m !== nothing
-            ep = parse(Int, m.captures[1])
-            if ep > best_epoch
-                best_epoch = ep
-                best_file = f
-            end
+        path = joinpath(CHECKPOINT_DIR, f)
+        mt = mtime(path)
+        if mt > best_mtime
+            best_mtime = mt
+            best_file = f
         end
     end
-    best_epoch > 0 ? joinpath(CHECKPOINT_DIR, best_file) : nothing
+    best_mtime > 0 ? joinpath(CHECKPOINT_DIR, best_file) : nothing
 end
 
 function main()
@@ -114,7 +113,12 @@ function main()
             state.step = cp_data[:step]
 
             # Determine which epoch to resume from
-            start_epoch = haskey(cp_data, :epoch) ? cp_data[:epoch] + 1 : (state.step ÷ length(manifest)) + 1
+            if haskey(cp_data, :epoch)
+                is_mid_epoch = occursin("_step", basename(cp_path))
+                start_epoch = is_mid_epoch ? cp_data[:epoch] : cp_data[:epoch] + 1
+            else
+                start_epoch = (state.step ÷ length(manifest)) + 1
+            end
             println("Resuming from epoch $start_epoch, step $(state.step)")
         else
             println("No checkpoint found, starting fresh")
@@ -136,15 +140,34 @@ function main()
     println("Projection matrix: $(size(proj_matrix))")
     println("Pipeline created: $(D_PROJECT)d, 16 slots, 2+4 layers")
 
-    # Populate rigid designation table from corpus
-    all_embeddings = Matrix{Float32}[]
-    all_tokens = Vector{String}[]
-    for entry in manifest
+    # Populate rigid designation table from corpus (streaming to save memory)
+    println("Populating rigid designation table (streaming)...")
+    rigid_terms = Peirce.default_rigid_terms()
+    foundational_terms = Peirce.default_foundational_terms()
+    term_embeds = Dict{String, Vector{Vector{Float32}}}()
+    for (i, entry) in enumerate(manifest)
         emb, tok = load_chunk(entry)
-        push!(all_embeddings, proj_matrix * emb)
-        push!(all_tokens, tok)
+        projected = proj_matrix * emb
+        for (t, token) in enumerate(tok)
+            clean = strip(token)
+            if haskey(rigid_terms, clean)
+                if !haskey(term_embeds, clean)
+                    term_embeds[clean] = Vector{Float32}[]
+                end
+                push!(term_embeds[clean], Vector{Float32}(projected[:, t]))
+            end
+        end
+        if i % 5000 == 0
+            println("  Scanned $i/$(length(manifest)) chunks for rigid terms")
+        end
     end
-    populate_from_corpus!(state.rigid_table, all_embeddings, all_tokens)
+    for (term, embeds) in term_embeds
+        avg_embed = Vector{Float32}(sum(embeds) ./ length(embeds))
+        rigidity = rigid_terms[term]
+        foundational = term in foundational_terms
+        insert!(state.rigid_table, term, avg_embed, rigidity; foundational)
+        insert!(state.rigid_table, " $term", avg_embed, rigidity; foundational)
+    end
     println("Rigid designation table: $(length(state.rigid_table.entries)) entries\n")
 
     # Training loop with Gumbel-Softmax temperature annealing

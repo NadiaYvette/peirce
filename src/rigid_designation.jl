@@ -107,7 +107,7 @@ function default_rigid_terms()
         # Natural kind terms
         "water" => 0.90f0, "gold" => 0.90f0, "oxygen" => 0.90f0,
         "hydrogen" => 0.90f0, "iron" => 0.90f0,
-        # Proper names
+        # Proper names — scientists/philosophers
         "Copernicus" => 0.95f0, "Kepler" => 0.95f0, "Galileo" => 0.95f0,
         "Watson" => 0.90f0, "Crick" => 0.90f0, "Newton" => 0.90f0,
         "Gutenberg" => 0.90f0, "Pompeii" => 0.90f0, "Vesuvius" => 0.90f0,
@@ -116,12 +116,40 @@ function default_rigid_terms()
         "Hume" => 0.90f0, "Rawls" => 0.90f0, "Wittgenstein" => 0.90f0,
         "Austin" => 0.85f0, "Grice" => 0.85f0, "Cantor" => 0.90f0,
         "Lakoff" => 0.85f0, "Johnson" => 0.85f0,
+        # Literary characters — English
+        "Alice" => 0.90f0, "Holmes" => 0.90f0, "Hamlet" => 0.95f0,
+        "Ophelia" => 0.90f0, "Polonius" => 0.90f0, "Horatio" => 0.90f0,
+        "Laertes" => 0.90f0, "Claudius" => 0.90f0, "Gertrude" => 0.90f0,
+        "Gulliver" => 0.90f0, "Socrates" => 0.95f0, "Plato" => 0.95f0,
+        "Pygmalion" => 0.90f0, "Eliza" => 0.90f0,
+        # Literary characters — German
+        "Faust" => 0.90f0, "Mephisto" => 0.90f0, "Gretchen" => 0.90f0,
+        "Werther" => 0.90f0, "Woyzeck" => 0.90f0, "Danton" => 0.90f0,
+        "Nora" => 0.90f0,
+        # Literary characters — French
+        "Bovary" => 0.90f0, "Emma" => 0.85f0, "Phedre" => 0.90f0,
+        "Alceste" => 0.90f0,
+        # Literary characters — Spanish
+        "Quijote" => 0.95f0, "Sancho" => 0.90f0, "Dulcinea" => 0.90f0,
+        # Literary characters — Russian
+        "Raskolnikov" => 0.90f0,
+        # Authors (appear frequently in corpus)
+        "Shakespeare" => 0.95f0, "Goethe" => 0.95f0, "Kafka" => 0.95f0,
+        "Cervantes" => 0.95f0, "Moliere" => 0.90f0, "Racine" => 0.90f0,
+        "Schiller" => 0.90f0, "Dostoevsky" => 0.90f0, "Tolstoy" => 0.90f0,
+        "Dickens" => 0.90f0, "Austen" => 0.90f0, "Flaubert" => 0.90f0,
+        "Baudelaire" => 0.90f0, "Rilke" => 0.90f0, "Pushkin" => 0.90f0,
+        "Zamenhof" => 0.90f0,
+        # Geographic — expanded with corpus locations
+        "Earth" => 0.95f0, "Sun" => 0.95f0, "Moon" => 0.95f0,
+        "Hawaii" => 0.90f0, "Europe" => 0.90f0,
+        "London" => 0.90f0, "Paris" => 0.90f0, "England" => 0.90f0,
+        "France" => 0.90f0, "Germany" => 0.90f0, "Spain" => 0.90f0,
+        "Russia" => 0.90f0, "Denmark" => 0.90f0, "Elsinore" => 0.90f0,
+        "Mancha" => 0.85f0,
         # Numerical/physical constants
         "299,792,458" => 0.99f0, "79" => 0.95f0, "1440" => 0.90f0,
         "1953" => 0.90f0, "1969" => 0.90f0, "1983" => 0.90f0,
-        # Geographic
-        "Earth" => 0.95f0, "Sun" => 0.95f0, "Moon" => 0.95f0,
-        "Hawaii" => 0.90f0, "Europe" => 0.90f0,
     )
 end
 
@@ -129,4 +157,66 @@ end
 function default_foundational_terms()
     Set{String}(["H2O", "DNA", "Au", "water", "gold", "oxygen", "hydrogen",
                   "Earth", "Sun", "Moon"])
+end
+
+"""
+    auto_discover_rigid_terms(token_strings_list, source_list; min_docs=3)
+
+Auto-discover potential rigid designators from the corpus.
+Finds capitalized words appearing across multiple documents, filtering out
+common sentence-starters and short words.
+
+Returns Dict{String, Float32} of discovered term => rigidity score.
+"""
+function auto_discover_rigid_terms(token_strings_list::Vector{Vector{String}},
+                                    source_list::Vector{String};
+                                    min_docs::Int=3)
+    # Common words to exclude (sentence-starters, articles, etc.)
+    stopwords = Set(["The", "A", "An", "In", "On", "At", "To", "For", "Of",
+                     "It", "He", "She", "We", "They", "But", "And", "Or",
+                     "So", "If", "As", "By", "Is", "Was", "Are", "Were",
+                     "No", "Not", "This", "That", "With", "From", "His",
+                     "Her", "My", "Your", "Its", "All", "One", "Two",
+                     "What", "When", "Where", "Who", "How", "Why",
+                     "There", "Here", "Each", "Every", "Some", "Any",
+                     "Do", "Did", "Has", "Had", "Have", "Will", "Would",
+                     "Could", "Should", "May", "Might", "Must", "Shall",
+                     "I", "You", "Me", "Him", "Us", "Them",
+                     "Mr", "Mrs", "Ms", "Dr", "Sir", "Lord", "Lady",
+                     "Chapter", "Act", "Scene", "Part", "Book", "Vol",
+                     "Project", "Section", "Page", "Yes", "Oh", "Now",
+                     "Then", "Well", "Come", "Let", "Yet", "Thus", "Still"])
+
+    # Track: term → set of source documents it appears in
+    term_docs = Dict{String, Set{String}}()
+
+    for (tokens, source) in zip(token_strings_list, source_list)
+        for tok in tokens
+            clean = strip(tok)
+            length(clean) < 3 && continue
+            # Check if capitalized (first char uppercase, not all uppercase)
+            first_char = first(clean)
+            !isuppercase(first_char) && continue
+            all(isuppercase, clean) && length(clean) > 3 && continue  # skip ALL CAPS
+            clean in stopwords && continue
+            # Must contain at least one lowercase letter
+            !any(islowercase, clean) && continue
+
+            if !haskey(term_docs, clean)
+                term_docs[clean] = Set{String}()
+            end
+            push!(term_docs[clean], source)
+        end
+    end
+
+    # Keep terms appearing in min_docs+ different documents
+    discovered = Dict{String, Float32}()
+    for (term, docs) in term_docs
+        n = length(docs)
+        n >= min_docs || continue
+        # Rigidity scales with document coverage (more docs = more rigid)
+        rigidity = clamp(Float32(0.70 + 0.02 * n), 0.70f0, 0.92f0)
+        discovered[term] = rigidity
+    end
+    discovered
 end

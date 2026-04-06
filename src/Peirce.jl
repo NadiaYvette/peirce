@@ -34,6 +34,8 @@ export slot_content_diversity_loss, interpretant_diversity_loss, segmentation_re
 export truth_value_loss
 export segmentation_sparsity_loss, sign_type_entropy_loss, consistency_loss, trichotomy_balance_loss
 export prototype_diversity_loss
+export pool_signs, text_level_contrastive_loss
+export auto_discover_rigid_terms
 export decompose_trichotomies, SIGN_CLASSES, NUM_SIGN_CLASSES
 
 end

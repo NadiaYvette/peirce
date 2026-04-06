@@ -60,6 +60,13 @@ const RIGID_DESIGNATION_TESTS = [
     ("Einstein developed the theory of relativity.", "Einstein"),
     ("Einstein was born in Germany.", "Einstein"),
     ("The theory of relativity was proposed by Einstein.", "Einstein"),
+    ("Hamlet spoke to the ghost of his father.", "Hamlet"),
+    ("The tragedy of Hamlet is set in Denmark.", "Hamlet"),
+    ("Hamlet decided to feign madness.", "Hamlet"),
+    ("Newton formulated the laws of motion.", "Newton"),
+    ("Newton discovered gravity while observing an apple.", "Newton"),
+    ("London is the capital of England.", "London"),
+    ("The fog rolled over London at dusk.", "London"),
 ]
 
 # Trichotomy constraint test texts
@@ -441,6 +448,7 @@ function main()
     @printf("  Semantic similarity separation: %.3f %s\n", sim_score, sim_score > 0 ? "✓" : "✗")
     @printf("  Sign-type distinctness:         %.2f %s\n", type_score, type_score > 0.3 ? "✓" : "✗")
     @printf("  Trichotomy violation rate:       %.1f%% %s\n", 100*trich_violations, trich_violations < 0.2 ? "✓" : "✗")
+    @printf("  Rigid designation entries:       %d\n", length(rigid_table.entries))
     println()
 
     shutdown!(base_model)

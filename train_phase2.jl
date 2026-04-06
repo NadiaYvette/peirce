@@ -36,14 +36,53 @@ function load_chunk(entry)
     (Float32.(embeddings), tokens)
 end
 
+"""Memory bank for text-level contrastive learning."""
+mutable struct ContrastiveMemoryBank
+    representations::Matrix{Float32}  # d_model × max_size
+    sources::Vector{String}           # source document for each entry
+    categories::Vector{String}        # corpus category for each entry
+    max_size::Int
+    count::Int                        # number of entries filled
+    idx::Int                          # next write position (circular)
+end
+
+function ContrastiveMemoryBank(d_model::Int; max_size::Int=256)
+    ContrastiveMemoryBank(
+        zeros(Float32, d_model, max_size),
+        fill("", max_size),
+        fill("", max_size),
+        max_size, 0, 1
+    )
+end
+
+function push_to_bank!(bank::ContrastiveMemoryBank, rep::Vector{Float32},
+                       source::String, category::String)
+    bank.representations[:, bank.idx] .= rep
+    bank.sources[bank.idx] = source
+    bank.categories[bank.idx] = category
+    bank.idx = mod1(bank.idx + 1, bank.max_size)
+    bank.count = min(bank.count + 1, bank.max_size)
+end
+
+function bank_data(bank::ContrastiveMemoryBank)
+    n = bank.count
+    n == 0 && return (zeros(Float32, size(bank.representations, 1), 0), String[], String[])
+    (bank.representations[:, 1:n], bank.sources[1:n], bank.categories[1:n])
+end
+
 function train_step_phase2!(state::TrainingState,
                             token_embeddings::AbstractMatrix{Float32},
                             token_strings::Vector{String};
-                            λ_contrastive::Float32=Float32(0.1),
+                            λ_contrastive::Float32=Float32(0.5),
                             λ_trichotomy::Float32=Float32(0.2),
-                            τ::Float32=Float32(0.5))
+                            λ_text_contrastive::Float32=Float32(1.0),
+                            τ::Float32=Float32(0.5),
+                            bank_reps::AbstractMatrix{Float32}=zeros(Float32, 0, 0),
+                            bank_sources::Vector{String}=String[],
+                            anchor_source::String="")
     T = size(token_embeddings, 2)
     graph = InferenceGraph(size(token_embeddings, 1))
+    pooled_ref = Ref{Vector{Float32}}(Float32[])
 
     (loss_val, loss_dict), grads = Flux.withgradient(state.pipeline, state.decoder) do pipeline, decoder
         signs, _, seg_weights = comprehend(pipeline, token_embeddings, state.rigid_table, token_strings;
@@ -71,6 +110,17 @@ function train_step_phase2!(state::TrainingState,
         end
         l_truth = truth_value_loss(signs, truth_targets)
 
+        # Text-level contrastive loss (InfoNCE over pooled representations)
+        l_text_contrastive = Float32(0)
+        anchor_rep = pool_signs(signs)
+        Zygote.ignore() do
+            pooled_ref[] = Vector{Float32}(anchor_rep)
+        end
+        if size(bank_reps, 2) > 0 && !isempty(anchor_source)
+            l_text_contrastive = text_level_contrastive_loss(
+                anchor_rep, bank_reps, bank_sources, anchor_source)
+        end
+
         total = Float32(0.5) * l_recon +
                 Float32(5.0) * l_seg_recon +
                 Float32(0.5) * l_entropy +
@@ -81,7 +131,8 @@ function train_step_phase2!(state::TrainingState,
                 Float32(0.5) * l_occupancy +
                 Float32(2.0) * l_trich_balance +
                 Float32(20.0) * l_proto_div +
-                Float32(2.0) * l_truth
+                Float32(2.0) * l_truth +
+                λ_text_contrastive * l_text_contrastive
 
         local_dict = Dict{String, Float32}(
             "total" => total,
@@ -96,6 +147,7 @@ function train_step_phase2!(state::TrainingState,
             "trich_balance" => l_trich_balance,
             "proto_div" => l_proto_div,
             "truth" => l_truth,
+            "text_contrastive" => l_text_contrastive,
         )
         (total, local_dict)
     end
@@ -103,7 +155,7 @@ function train_step_phase2!(state::TrainingState,
     Flux.update!(state.opt_state, (state.pipeline, state.decoder), grads)
     state.step += 1
     push!(state.losses, loss_dict)
-    loss_dict
+    (loss_dict, pooled_ref[])
 end
 
 function find_latest_checkpoint(tag::String)
@@ -111,19 +163,19 @@ function find_latest_checkpoint(tag::String)
     candidates = filter(f -> startswith(f, "$(tag)_epoch") && endswith(f, ".bson"), readdir(CHECKPOINT_DIR))
     isempty(candidates) && return nothing
 
-    best_epoch = 0
+    # Use file modification time to find the most recently saved checkpoint
+    # Matches both epoch-end (phase2_epoch5.bson) and mid-epoch (phase2_epoch5_step5000.bson)
+    best_mtime = 0.0
     best_file = ""
     for f in candidates
-        m = match(r"epoch(\d+)\.bson$", f)
-        if m !== nothing
-            ep = parse(Int, m.captures[1])
-            if ep > best_epoch
-                best_epoch = ep
-                best_file = f
-            end
+        path = joinpath(CHECKPOINT_DIR, f)
+        mt = mtime(path)
+        if mt > best_mtime
+            best_mtime = mt
+            best_file = f
         end
     end
-    best_epoch > 0 ? joinpath(CHECKPOINT_DIR, best_file) : nothing
+    best_mtime > 0 ? joinpath(CHECKPOINT_DIR, best_file) : nothing
 end
 
 function main()
@@ -159,7 +211,13 @@ function main()
             Flux.loadmodel!(state.pipeline, cp_data[:pipeline])
             Flux.loadmodel!(state.decoder, cp_data[:decoder])
             state.step = cp_data[:step]
-            start_epoch = haskey(cp_data, :epoch) ? cp_data[:epoch] + 1 : (state.step ÷ length(manifest)) + 1
+            if haskey(cp_data, :epoch)
+                # Mid-epoch checkpoints include _step in filename; resume same epoch
+                is_mid_epoch = occursin("_step", basename(cp_path))
+                start_epoch = is_mid_epoch ? cp_data[:epoch] : cp_data[:epoch] + 1
+            else
+                start_epoch = (state.step ÷ length(manifest)) + 1
+            end
             println("Resuming from epoch $start_epoch, step $(state.step)")
         else
             println("No Phase 2 checkpoint found, falling back to Phase 1")
@@ -208,25 +266,96 @@ function main()
         end
     end
 
-    # Populate rigid designation table from corpus
-    all_embeddings = Matrix{Float32}[]
-    all_tokens = Vector{String}[]
+    # Populate rigid designation table from corpus (single-pass, memory-efficient)
+    # Pass 1: lightweight scan for auto-discovery (only track term→doc counts, no embeddings)
+    println("Auto-discovering rigid designators (lightweight scan)...")
+    rigid_terms = Peirce.default_rigid_terms()
+    foundational_terms = Peirce.default_foundational_terms()
+    term_docs = Dict{String, Set{String}}()
+    stopwords = Set(["The", "A", "An", "In", "On", "At", "To", "For", "Of",
+                     "It", "He", "She", "We", "They", "But", "And", "Or",
+                     "So", "If", "As", "By", "Is", "Was", "Are", "Were",
+                     "No", "Not", "This", "That", "With", "From", "His",
+                     "Her", "My", "Your", "Its", "All", "One", "Two",
+                     "What", "When", "Where", "Who", "How", "Why",
+                     "There", "Here", "Each", "Every", "Some", "Any",
+                     "Do", "Did", "Has", "Had", "Have", "Will", "Would",
+                     "Could", "Should", "May", "Might", "Must", "Shall",
+                     "I", "You", "Me", "Him", "Us", "Them",
+                     "Mr", "Mrs", "Ms", "Dr", "Sir", "Lord", "Lady",
+                     "Chapter", "Act", "Scene", "Part", "Book", "Vol",
+                     "Project", "Section", "Page", "Yes", "Oh", "Now",
+                     "Then", "Well", "Come", "Let", "Yet", "Thus", "Still"])
     for entry in manifest
-        emb, tok = load_chunk(entry)
-        push!(all_embeddings, proj_matrix * emb)
-        push!(all_tokens, tok)
+        source = String(entry.source)
+        for tok in entry.tokens
+            clean = strip(String(tok))
+            length(clean) < 3 && continue
+            fc = first(clean)
+            !isuppercase(fc) && continue
+            all(isuppercase, clean) && length(clean) > 3 && continue
+            clean in stopwords && continue
+            !any(islowercase, clean) && continue
+            if !haskey(term_docs, clean)
+                term_docs[clean] = Set{String}()
+            end
+            push!(term_docs[clean], source)
+        end
     end
-    populate_from_corpus!(state.rigid_table, all_embeddings, all_tokens)
+    for (term, docs) in term_docs
+        length(docs) >= 3 || continue
+        if !haskey(rigid_terms, term)
+            rigid_terms[term] = clamp(Float32(0.70 + 0.02 * length(docs)), 0.70f0, 0.92f0)
+        end
+    end
+    n_discovered = length(rigid_terms) - length(Peirce.default_rigid_terms())
+    println("  Discovered $n_discovered terms, total rigid terms: $(length(rigid_terms))")
+    term_docs = nothing  # free
+
+    # Pass 2: collect embeddings only for rigid terms (streaming, one chunk at a time)
+    println("Collecting rigid term embeddings...")
+    term_embeds = Dict{String, Vector{Vector{Float32}}}()
+    for (i, entry) in enumerate(manifest)
+        emb, tok = load_chunk(entry)
+        projected = proj_matrix * emb
+        for (t, token) in enumerate(tok)
+            clean = strip(token)
+            if haskey(rigid_terms, clean)
+                if !haskey(term_embeds, clean)
+                    term_embeds[clean] = Vector{Float32}[]
+                end
+                push!(term_embeds[clean], Vector{Float32}(projected[:, t]))
+            end
+        end
+        if i % 5000 == 0
+            println("  Scanned $i/$(length(manifest)) chunks")
+        end
+    end
+    for (term, embeds) in term_embeds
+        isempty(embeds) && continue
+        avg_embed = Vector{Float32}(sum(embeds) ./ length(embeds))
+        rigidity = rigid_terms[term]
+        foundational = term in foundational_terms
+        insert!(state.rigid_table, term, avg_embed, rigidity; foundational)
+        insert!(state.rigid_table, " $term", avg_embed, rigidity; foundational)
+    end
+    term_embeds = nothing
+    GC.gc()
     println("Rigid designation table: $(length(state.rigid_table.entries)) entries")
+
+    # Initialize contrastive memory bank
+    bank = ContrastiveMemoryBank(D_PROJECT; max_size=256)
+    println("Contrastive memory bank initialized (size=256)")
 
     # Phase 2 training loop
     for epoch in start_epoch:num_epochs
         # Ramp contrastive and trichotomy losses
         progress = Float32(min(epoch / 10, 1.0))
-        λ_c = Float32(0.1) * progress
-        λ_t = Float32(0.2) * progress
+        λ_c = Float32(0.5) * progress      # slot contrastive: increased from 0.1 to 0.5
+        λ_t = Float32(0.2) * progress      # trichotomy
+        λ_tc = Float32(1.0) * progress     # text-level contrastive: ramps to 1.0
 
-        println("--- Phase 2 Epoch $epoch/$num_epochs (λ_contrastive=$(round(λ_c; digits=3)), λ_trichotomy=$(round(λ_t; digits=3))) ---")
+        println("--- Phase 2 Epoch $epoch/$num_epochs (λ_slot_contr=$(round(λ_c; digits=3)), λ_text_contr=$(round(λ_tc; digits=3)), λ_trich=$(round(λ_t; digits=3))) ---")
 
         indices = randperm(length(manifest))
         epoch_losses = Dict{String, Float64}()
@@ -235,9 +364,23 @@ function main()
         for i in indices
             raw_emb, tokens = load_chunk(manifest[i])
             embeddings = proj_matrix * raw_emb
-            loss_dict = train_step_phase2!(state, embeddings, tokens;
+            source = String(manifest[i].source)
+            category = String(manifest[i].category)
+
+            # Get current memory bank state (detached — no gradients)
+            b_reps, b_sources, b_categories = bank_data(bank)
+
+            loss_dict, pooled_rep = train_step_phase2!(state, embeddings, tokens;
                                            λ_contrastive=λ_c, λ_trichotomy=λ_t,
-                                           τ=Float32(0.3))
+                                           λ_text_contrastive=λ_tc,
+                                           τ=Float32(0.3),
+                                           bank_reps=b_reps,
+                                           bank_sources=b_sources,
+                                           anchor_source=source)
+
+            # Update memory bank with current chunk's pooled representation
+            push_to_bank!(bank, pooled_rep, source, category)
+
             for (k, v) in loss_dict
                 epoch_losses[k] = get(epoch_losses, k, 0.0) + v
             end
@@ -246,9 +389,18 @@ function main()
             if state.step % 5 == 0
                 println("  Step $(state.step): total=$(round(loss_dict["total"]; digits=4)), " *
                         "recon=$(round(loss_dict["reconstruction"]; digits=4)), " *
-                        "contrastive=$(round(loss_dict["contrastive"]; digits=4)), " *
+                        "slot_c=$(round(loss_dict["contrastive"]; digits=4)), " *
+                        "text_c=$(round(loss_dict["text_contrastive"]; digits=4)), " *
                         "truth=$(round(loss_dict["truth"]; digits=4)), " *
-                        "trich_bal=$(round(loss_dict["trich_balance"]; digits=4))")
+                        "trich=$(round(loss_dict["trich_balance"]; digits=4))")
+            end
+
+            # Mid-epoch checkpoint every 5000 steps (~1 hour) to limit OOM loss
+            if state.step % 5000 == 0
+                mkpath(CHECKPOINT_DIR)
+                mid_path = joinpath(CHECKPOINT_DIR, "phase2_epoch$(epoch)_step$(state.step).bson")
+                BSON.@save mid_path pipeline=state.pipeline decoder=state.decoder step=state.step proj_matrix=proj_matrix epoch=epoch
+                println("  Mid-epoch checkpoint: $mid_path")
             end
         end
 
@@ -256,7 +408,8 @@ function main()
             epoch_losses[k] /= max(n, 1)
         end
         println("  Epoch avg: recon=$(round(epoch_losses["reconstruction"]; digits=4)), " *
-                "contrastive=$(round(get(epoch_losses, "contrastive", 0.0); digits=4)), " *
+                "slot_c=$(round(get(epoch_losses, "contrastive", 0.0); digits=4)), " *
+                "text_c=$(round(get(epoch_losses, "text_contrastive", 0.0); digits=4)), " *
                 "trich_bal=$(round(get(epoch_losses, "trich_balance", 0.0); digits=4)), " *
                 "proto=$(round(get(epoch_losses, "proto_div", 0.0); digits=4))")
 

@@ -50,9 +50,11 @@ python/
   corpus_loader.py     — corpus-based training data preparation
 
 corpus/                — training texts by category (public domain)
-train.jl               — Phase 1 training (distillation)
-train_phase2.jl        — Phase 2 training (contrastive + structure)
-evaluate.jl            — downstream evaluation suite
+  literature/          — multilingual literary texts (EN, DE, ES, FR, RU, Esperanto)
+  factual/             — scientific texts (Darwin, Newton, Galileo, Aristotle, etc.)
+train.jl               — Phase 1 training (distillation + reconstruction)
+train_phase2.jl        — Phase 2 training (contrastive + structure + text-level InfoNCE)
+evaluate.jl            — downstream evaluation suite (6 evaluations)
 end_to_end.jl          — full pipeline integration test
 ```
 
@@ -90,10 +92,43 @@ JULIA_PKG_SERVER="" julia --project=. end_to_end.jl
 
 - Full pipeline working end-to-end with live Qwen embeddings
 - Conditioned generation functional (semiotic soft-prompt injection)
-- Phase 1 + Phase 2 training complete on small corpus
-- Evaluation: 0% trichotomy violations, semantic similarity separation, conditioned output differentiation
+- Phase 1 training complete (30 epochs, 941k steps)
+- Phase 2 training with text-level contrastive loss in progress (30 epochs over expanded corpus)
+- **Rigid designation**: auto-discovery from corpus (2,194 terms found), 4,468 rigid table entries
+- **Corpus**: multilingual literature (EN, DE, ES, FR, RU, Esperanto) + scientific texts (33,517 chunks)
+- **Evaluation results** (Phase 1 checkpoint):
+  - 0% trichotomy violations
+  - Semantic similarity separation: 0.018
+  - Sign-type distinctness: 0.67
+  - Conditioned generation producing differentiated outputs
 - Interaction boundary detection (anthropomorphisation, emotional escalation, dependency patterns)
-- Multilingual corpus assembly in progress
+- Mid-epoch checkpointing every 5,000 steps for crash resilience
+
+## Training
+
+Training proceeds in two phases:
+
+**Phase 1** — Distillation and reconstruction. The semiotic pipeline learns to segment, classify, and reconstruct token embeddings from the base model. Losses: reconstruction, segmentation reconstruction, diversity, sign-type entropy, occupancy, truth value, prototype diversity.
+
+**Phase 2** — Contrastive and structural refinement. Adds:
+- **Slot contrastive loss**: different sign types should produce different content embeddings
+- **Text-level contrastive loss** (InfoNCE): pooled sign representations should distinguish documents
+- **Trichotomy consistency**: enforces Peirce's validity constraints (I >= II >= III)
+- **Rigid designation**: auto-discovers proper nouns from corpus, maintains stable embeddings across contexts
+- **Contrastive memory bank**: circular buffer of 256 pooled representations for cross-document contrast
+
+Both phases support `--resume` for crash recovery (checkpoint selection by mtime) and save mid-epoch checkpoints every 5,000 steps.
+
+```bash
+# Phase 1 (from scratch)
+JULIA_PKG_SERVER="" julia --project=. train.jl
+
+# Phase 2 (builds on Phase 1)
+JULIA_PKG_SERVER="" julia --project=. train_phase2.jl
+
+# Resume after crash
+JULIA_PKG_SERVER="" julia --project=. train_phase2.jl --resume
+```
 
 ## Theoretical Foundation
 

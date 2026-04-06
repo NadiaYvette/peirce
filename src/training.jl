@@ -455,6 +455,56 @@ function slot_contrastive_loss(signs::SignBatch)
 end
 
 """
+    pool_signs(signs) -> Vector{Float32}
+
+Pool slot content into a single text-level representation,
+weighted by inferential weight (truth value component 3).
+"""
+function pool_signs(signs::SignBatch)
+    w = signs.truth[3:3, :]  # 1 × K — inferential weight
+    w_norm = w ./ (sum(w) + Float32(1e-8))
+    vec(signs.content * w_norm')  # d_model
+end
+
+"""
+    text_level_contrastive_loss(anchor, bank_reps, bank_sources, anchor_source; τ=0.1)
+
+InfoNCE loss over pooled sign representations.
+Positives: chunks from same document. Negatives: chunks from different documents.
+bank_reps columns are detached (no gradient flows through them).
+"""
+function text_level_contrastive_loss(anchor::AbstractVector{Float32},
+                                     bank_reps::AbstractMatrix{Float32},
+                                     bank_sources::Vector{String},
+                                     anchor_source::String;
+                                     τ::Float32=Float32(0.1))
+    N = size(bank_reps, 2)
+    N == 0 && return Float32(0)
+
+    eps = Float32(1e-8)
+    a_norm = anchor ./ (sqrt(sum(anchor .^ 2)) + eps)
+    b_norms = sqrt.(sum(bank_reps .^ 2; dims=1) .+ eps)
+    b_normed = bank_reps ./ b_norms
+
+    sims = (a_norm' * b_normed) ./ τ  # 1 × N
+
+    # Mask: 1 for positives (same source), 0 for negatives
+    # Must use Zygote.ignore to avoid array mutation inside AD
+    pos_mask = Zygote.ignore() do
+        Float32[s == anchor_source ? 1f0 : 0f0 for s in bank_sources]
+    end
+    n_pos = sum(pos_mask)
+    n_pos < 1f0 && return Float32(0)  # no positives in bank
+
+    # InfoNCE: -log(sum(exp(pos)) / sum(exp(all)))
+    max_sim = maximum(sims)
+    exp_sims = exp.(sims .- max_sim)  # numerically stable
+    pos_sum = sum(exp_sims .* pos_mask')
+    all_sum = sum(exp_sims)
+    -log(pos_sum / (all_sum + eps) + eps)
+end
+
+"""
     trichotomy_consistency_loss(signs)
 
 The three trichotomy marginals should obey Peirce's validity constraint:
